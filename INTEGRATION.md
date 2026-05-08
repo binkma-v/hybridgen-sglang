@@ -937,11 +937,11 @@ HybridKVCacheAttnBackend feedback: topk_ratio 0.0720 -> 0.0864, cpu_k_cap 0 -> 0
 - 公共启动参数：`--disable-radix-cache --disable-cuda-graph --disable-piecewise-cuda-graph --max-running-requests 1 --max-total-tokens 12288 --mem-fraction-static 0.70`
 - Hybrid 参数：`--hybridgen-gpu-cache-factor 0.1 --hybridgen-topk-ratio 0.05 --hybridgen-cpu-k-cap 2048 --hybridgen-feedback-interval 4 --hybridgen-host-ratio 2.0 --hybridgen-host-layout layer_first`
 
-| Prompt tokens | torch_native | hybrid_kvcache<br>(cap 修复后) | hybrid_kvcache<br>(unique/workspace 后) | hybrid_kvcache<br>(Triton fused 后) | hybrid:native | 输出 |
-|---:|---:|---:|---:|---:|---:|---|
-| 2,048 | 814 ms | 2,670 ms | 1,865 ms | 1,723 ms | 2.1× | 32 / 32 token ✅ |
-| 4,096 | 848 ms | 3,199 ms | 1,952 ms | 1,809 ms | 2.1× | 32 / 32 token ✅ |
-| 8,192 | 1,027 ms | 3,423 ms | 2,128 ms | 1,992 ms | 1.9× | 32 / 32 token ✅ |
+| Prompt tokens | torch_native | hybrid_kvcache<br>(cap 修复后) | hybrid_kvcache<br>(unique/workspace 后) | hybrid_kvcache<br>(Triton fused 后) | hybrid_kvcache<br>(guarded overlap 后) | hybrid:native | 输出 |
+|---:|---:|---:|---:|---:|---:|---:|---|
+| 2,048 | 814 ms | 2,670 ms | 1,865 ms | 1,723 ms | 1,806 ms | 2.2× | 32 / 32 token ✅ |
+| 4,096 | 848 ms | 3,199 ms | 1,952 ms | 1,809 ms | 1,804 ms | 2.1× | 32 / 32 token ✅ |
+| 8,192 | 1,027 ms | 3,423 ms | 2,128 ms | 1,992 ms | 1,986 ms | 1.9× | 32 / 32 token ✅ |
 
 Hybrid 日志证据：
 - 2k：`cpu_len=1847, gpu_len=204`，符合 `factor=0.1` 后约 90% host / 10% GPU。
@@ -949,12 +949,14 @@ Hybrid 日志证据：
 - 8k：`cpu_len=7376, gpu_len=819`，同样符合 90% host / 10% GPU。
 - `cpu_k_cap` 有效限制 CPU 扫描窗口：8k 场景从 `effective_cpu_len=2048` 收紧到 `1024 -> 512 -> 256 -> 128`，之后按反馈逐步放宽到 `153 -> 183 -> 219 -> 262`。
 - cleanup 路径正常：`completion_tokens=32`，没有早停、double-free 或 cache cleanup 崩溃。
+- guarded overlap 路径正常：top-k scores / V 的 host→device copy 现在可在独立 CUDA stream 上执行，并把 GPU dense segment gather 延后到 copy enqueue 之后。默认参数下 2k/4k/8k 的 top-k 传输小于 1 MiB threshold，大多继续走直接 `.to()`，避免 pinned staging 在小传输上反而变慢；该路径主要面向更大 `topk_ratio` / `cpu_k_cap` 场景。
 
 结论：
 - shadow-copy 释放修复后的功能正确性通过：强制 eviction 下 2k/4k/8k 都能完整 decode 32 token。
 - `cpu_k_cap` 默认 2048 + feedback 收紧后，8k hybrid 从上一轮 `20.9s` 降到 `3.42s`。
 - 去掉 `torch.unique + scatter_` 并复用 top-k workspace 后，8k 进一步从 `3.42s` 降到 `2.13s`；2k/4k 也分别降到 `1.87s` / `1.95s`。
 - Triton fused merged-softmax 后，8k 进一步降到 `1.99s`；2k/4k 分别为 `1.72s` / `1.81s`。剩余 gap 主要来自 CPU top-k eager 路径、每层 CPU/GPU 同步和 host→device top-k V 传输。
+- guarded H2D overlap 后，latest 2k/4k/8k 为 `1.81s` / `1.80s` / `1.99s`。这个改动不是默认小 top-k case 的主要加速项，而是把大 top-k 传输的 overlap 语义正式落到 backend hot path，并用 1 MiB threshold 避免小传输回退。
 
 ---
 

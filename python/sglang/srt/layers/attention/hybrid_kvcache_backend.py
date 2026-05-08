@@ -99,6 +99,12 @@ class HybridKVCacheAttnBackend(AttentionBackend):
         self._topk_workspace = CPUTopKWorkspace()
         self._q_to_kv_head_cache: Dict[tuple[int, int], torch.Tensor] = {}
         self._q_to_kv_topk_head_cache: Dict[tuple[int, int, int], torch.Tensor] = {}
+        self._h2d_stream: Optional[torch.cuda.Stream] = None
+        self._pinned_scores: Optional[torch.Tensor] = None
+        self._pinned_topk_v: Optional[torch.Tensor] = None
+        self._h2d_overlap_min_bytes = 1 << 20
+        if torch.device(self.device).type == "cuda":
+            self._h2d_stream = torch.cuda.Stream(device=self.device)
 
     # ------------------------------------------------------------------
     # Feedback scheduler bootstrap
@@ -282,6 +288,71 @@ class HybridKVCacheAttnBackend(AttentionBackend):
         )
         self._q_to_kv_topk_head_cache[key] = mapping
         return mapping
+
+    @staticmethod
+    def _ensure_pinned_workspace(
+        tensor: Optional[torch.Tensor],
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if (
+            tensor is None
+            or tuple(tensor.shape) != shape
+            or tensor.dtype != dtype
+            or not tensor.is_pinned()
+        ):
+            return torch.empty(shape, dtype=dtype, pin_memory=True)
+        return tensor
+
+    def _copy_topk_to_device_async(
+        self,
+        topk_scores_cpu: torch.Tensor,
+        v_topk_host: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.cuda.Event]]:
+        """Stage CPU top-k artefacts in pinned memory and copy on a side stream."""
+        if self._h2d_stream is None or torch.device(device).type != "cuda":
+            return (
+                topk_scores_cpu.to(device=device, dtype=dtype, non_blocking=True),
+                v_topk_host.to(device=device, dtype=dtype, non_blocking=True),
+                None,
+            )
+        dtype_bytes = torch.empty((), dtype=dtype).element_size()
+        transfer_bytes = (
+            topk_scores_cpu.numel() + v_topk_host.numel()
+        ) * dtype_bytes
+        if transfer_bytes < self._h2d_overlap_min_bytes:
+            return (
+                topk_scores_cpu.to(device=device, dtype=dtype, non_blocking=True),
+                v_topk_host.to(device=device, dtype=dtype, non_blocking=True),
+                None,
+            )
+
+        if topk_scores_cpu.dtype != dtype:
+            topk_scores_cpu = topk_scores_cpu.to(dtype=dtype)
+        if v_topk_host.dtype != dtype:
+            v_topk_host = v_topk_host.to(dtype=dtype)
+
+        self._pinned_scores = self._ensure_pinned_workspace(
+            self._pinned_scores, tuple(topk_scores_cpu.shape), dtype
+        )
+        self._pinned_topk_v = self._ensure_pinned_workspace(
+            self._pinned_topk_v, tuple(v_topk_host.shape), dtype
+        )
+        self._pinned_scores.copy_(topk_scores_cpu)
+        self._pinned_topk_v.copy_(v_topk_host)
+
+        scores_gpu = torch.empty(
+            topk_scores_cpu.shape, device=device, dtype=dtype
+        )
+        v_topk_gpu = torch.empty(v_topk_host.shape, device=device, dtype=dtype)
+        copy_event = torch.cuda.Event()
+        with torch.cuda.stream(self._h2d_stream):
+            scores_gpu.copy_(self._pinned_scores, non_blocking=True)
+            v_topk_gpu.copy_(self._pinned_topk_v, non_blocking=True)
+            copy_event.record(self._h2d_stream)
+        return scores_gpu, v_topk_gpu, copy_event
 
     def _can_release_device_slots(
         self, cache_protected_len: int, is_prefill: bool
@@ -663,10 +734,10 @@ class HybridKVCacheAttnBackend(AttentionBackend):
             # GPU-side dense attention to avoid double-counting against the
             # top-k selection. Their GPU shadows may already have been released.
             per_req_tokens = req_to_token[req_pool_idx, n_host:seq_len_kv]
-            per_req_k = k_cache[per_req_tokens]  # (S_gpu, nkv, qk_head_dim)
-            per_req_v = v_cache[per_req_tokens]  # (S_gpu, nkv, v_head_dim)
 
             if n_host == 0:
+                per_req_k = k_cache[per_req_tokens]  # (S_gpu, nkv, qk_head_dim)
+                per_req_v = v_cache[per_req_tokens]  # (S_gpu, nkv, v_head_dim)
                 # Dense fallback for this request — equivalent to torch_native.
                 k_dense = per_req_k.movedim(0, 1)  # (nkv, S_gpu, qk_head_dim)
                 v_dense = per_req_v.movedim(0, 1)
@@ -718,12 +789,16 @@ class HybridKVCacheAttnBackend(AttentionBackend):
                 layer.layer_id, host_idx_per_head, kv_heads
             ].view(nq, k_eff, layer.v_head_dim)
 
-            scores_gpu = topk_scores_cpu.to(
-                device=device, dtype=per_req_q.dtype, non_blocking=True
+            scores_gpu, v_topk_gpu, topk_copy_event = self._copy_topk_to_device_async(
+                topk_scores_cpu, v_topk_host, device, per_req_q.dtype
             )
-            v_topk_gpu = v_topk_host.to(
-                device=device, dtype=per_req_q.dtype, non_blocking=True
-            )
+
+            # Launch the GPU dense-segment gather after top-k H2D has been
+            # enqueued on the side stream, so these independent transfers can
+            # overlap. Keeping this after q_cpu avoids synchronizing the gather
+            # through the GPU->CPU Q copy.
+            per_req_k = k_cache[per_req_tokens]  # (S_gpu, nkv, qk_head_dim)
+            per_req_v = v_cache[per_req_tokens]  # (S_gpu, nkv, v_head_dim)
 
             # Cast K/V to Q dtype if needed (matches torch_native fallback).
             k_g = per_req_k
@@ -731,6 +806,9 @@ class HybridKVCacheAttnBackend(AttentionBackend):
             if per_req_q.dtype != k_g.dtype:
                 k_g = k_g.to(per_req_q.dtype)
                 v_g = v_g.to(per_req_q.dtype)
+
+            if topk_copy_event is not None:
+                torch.cuda.current_stream(device).wait_event(topk_copy_event)
 
             out_seq = merged_softmax_attention_per_head_v_triton(
                 per_req_q,
