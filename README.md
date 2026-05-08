@@ -1,49 +1,97 @@
-<div align="center" id="sglangtop">
-<img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400" margin="10px"></img>
+# HybridGen SGLang
 
-[![PyPI](https://img.shields.io/pypi/v/sglang)](https://pypi.org/project/sglang)
-![PyPI - Downloads](https://static.pepy.tech/badge/sglang?period=month)
-[![license](https://img.shields.io/github/license/sgl-project/sglang.svg)](https://github.com/sgl-project/sglang/tree/main/LICENSE)
-[![issue resolution](https://img.shields.io/github/issues-closed-raw/sgl-project/sglang)](https://github.com/sgl-project/sglang/issues)
-[![open issues](https://img.shields.io/github/issues-raw/sgl-project/sglang)](https://github.com/sgl-project/sglang/issues)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/sgl-project/sglang)
+This fork integrates a HybridGen-style KV cache offloading backend into
+SGLang. The backend keeps a recent KV window on GPU, offloads older KV to host
+memory, selects CPU-resident heavy-hitter tokens with CPU top-k, and computes a
+single merged softmax over CPU top-k scores plus the GPU dense segment.
 
-</div>
+The implementation is focused on decode-time KV cache offloading for MHA
+models. It is not a replacement for the full upstream SGLang project; the
+original SGLang documentation remains the best reference for installation,
+serving APIs, model support, and deployment:
 
---------------------------------------------------------------------------------
+- SGLang docs: https://docs.sglang.io/
+- Upstream repository: https://github.com/sgl-project/sglang
 
-<p align="center">
-<a href="https://lmsys.org/blog/"><b>Blog</b></a> |
-<a href="https://docs.sglang.io/"><b>Documentation</b></a> |
-<a href="https://roadmap.sglang.io/"><b>Roadmap</b></a> |
-<a href="https://slack.sglang.io/"><b>Join Slack</b></a> |
-<a href="https://meet.sglang.io/"><b>Weekly Dev Meeting</b></a> |
-<a href="https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#slides"><b>Slides</b></a>
-</p>
-
-## HybridGen × SGLang Integration
-
-This fork integrates a HybridGen-style KV cache offloading backend into SGLang.
-It keeps the recent KV segment on GPU, offloads older KV to host memory, selects CPU-resident heavy-hitter tokens with CPU top-k, and computes one merged softmax over CPU top-k scores plus the GPU dense segment.
-
-Implemented work in this fork:
+## Implemented Work
 
 - `hybrid_kvcache` attention backend for MHA models.
 - Host KV storage through SGLang's `MHATokenToKVPoolHost`.
-- GPU KV shadow release for request-owned offloaded tokens, with released-slot cleanup protections in chunk/radix cache paths.
-- Adaptive `topk_ratio` / `cpu_k_cap` feedback policy, with default `cpu_k_cap=2048`.
-- Decode hot-path optimizations: grouped CPU bmm, reusable top-k workspace, per-head V gather without `torch.unique`, a Triton fused merged-softmax kernel, guarded side-stream H2D copy overlap, and guarded CPU/GPU partial-attention overlap for larger cap settings.
-- Unit tests for release semantics, feedback cap behavior, CPU top-k workspace reuse, and Triton fused attention equivalence.
+- GPU KV shadow release for request-owned offloaded tokens, with cleanup
+  protections in chunk/radix cache paths.
+- Adaptive `topk_ratio` / `cpu_k_cap` feedback policy.
+- Minimum GPU recent window for short-prompt long-generation workloads:
+  `gpu_cap = max(prompt_len * gpu_cache_factor, min_gpu_recent_tokens, 1)`.
+- Decode hot-path optimizations:
+  - grouped CPU bmm for GQA-aware top-k scoring
+  - reusable CPU top-k workspace
+  - per-head V gather without `torch.unique`
+  - Triton fused merged-softmax attention
+  - guarded H2D side-stream copy overlap
+  - guarded CPU/GPU partial-attention overlap for larger cap settings
+- Decode profiling with per-layer attribution for CPU top-k, host V gather,
+  H2D, GPU attention/merge, and eviction copy time.
+- Unit tests for release semantics, feedback cap behavior, residency cap,
+  workspace reuse, and Triton attention equivalence.
 
-Example launch:
+## Environment
+
+The commands below assume the repository root is:
 
 ```bash
-python -m sglang.launch_server \
-  --model-path /path/to/model \
+cd /home/binkma/bm_ds/hybridgen-sglang/sglang
+```
+
+Use the prepared Python environment:
+
+```bash
+PYTHONPATH=python .venv/bin/python -c "import torch; print(torch.__version__)"
+```
+
+The benchmark commands below use this local model snapshot:
+
+```bash
+MODEL=/grand/hp-ptycho/binkma/HFmodel/hub/models--Qwen--Qwen2.5-Coder-3B/snapshots/09d9bc5d376b0cfa0100a0694ea7de7232525803
+```
+
+## Unit Tests
+
+Run the HybridGen-specific tests:
+
+```bash
+PYTHONPATH=python .venv/bin/python -m py_compile \
+  python/sglang/srt/server_args.py \
+  python/sglang/srt/layers/attention/hybrid_kvcache_backend.py \
+  python/sglang/srt/layers/attention/hybridgen_topk.py
+
+PYTHONPATH=python .venv/bin/python test/registered/unit/layers/test_hybridgen_topk.py
+PYTHONPATH=python .venv/bin/python test/registered/unit/layers/test_hybridgen_feedback.py
+PYTHONPATH=python .venv/bin/python test/registered/unit/layers/test_hybridgen_residency.py
+PYTHONPATH=python .venv/bin/python test/registered/unit/mem_cache/test_hybridgen_release.py
+```
+
+## Launch Hybrid Backend
+
+Example launch for forced offload with a 512-token minimum GPU recent window:
+
+```bash
+env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+  -u all_proxy -u ALL_PROXY \
+  HOME=/home/binkma \
+  PYTHONPATH=python \
+  NO_PROXY=127.0.0.1,localhost \
+  no_proxy=127.0.0.1,localhost \
+  .venv/bin/python -m sglang.launch_server \
+  --model-path "$MODEL" \
+  --host 127.0.0.1 \
+  --port 31000 \
   --attention-backend hybrid_kvcache \
   --disable-radix-cache \
   --disable-cuda-graph \
   --disable-piecewise-cuda-graph \
+  --max-running-requests 1 \
+  --max-total-tokens 12288 \
+  --mem-fraction-static 0.70 \
   --hybridgen-gpu-cache-factor 0.1 \
   --hybridgen-min-gpu-recent-tokens 512 \
   --hybridgen-topk-ratio 0.05 \
@@ -53,77 +101,163 @@ python -m sglang.launch_server \
   --hybridgen-host-layout layer_first
 ```
 
-For decode profiling, launch with `SGLANG_HYBRIDGEN_PROFILE=1`. The backend logs per-layer averages every `SGLANG_HYBRIDGEN_PROFILE_INTERVAL` decode steps, including CPU top-k, host V gather, H2D, GPU attention/merge, and eviction copy time. Profiling synchronizes GPU work for measurement, so use it for attribution rather than throughput numbers.
+Key HybridGen options:
 
-On A100-40GB with Qwen2.5-Coder-3B, forced eviction (`gpu_cache_factor=0.1`) and 32-token decode completed successfully for 2k/4k/8k prompts. The optimized hybrid path measured approximately 1.74s / 1.84s / 2.02s respectively in the latest guarded-overlap run, down from 20.9s at 8k before cap/workspace/fused-kernel fixes.
+- `--hybridgen-gpu-cache-factor`: fraction of the prompt-sized window kept on
+  GPU.
+- `--hybridgen-min-gpu-recent-tokens`: minimum recent KV window kept on GPU;
+  default is `512`, and `0` restores the old factor-only behavior.
+- `--hybridgen-topk-ratio`: host top-k ratio.
+- `--hybridgen-cpu-k-cap`: cap on host K length scanned by CPU top-k.
+- `--hybridgen-feedback-interval`: decode steps between feedback updates;
+  `0` disables feedback.
 
-For the full design, implementation notes, benchmark commands, and remaining follow-ups, see [INTEGRATION.md](INTEGRATION.md).
+## Launch Torch Native Baseline
 
-## News
-- [2026/02] 🔥 Unlocking 25x Inference Performance with SGLang on NVIDIA GB300 NVL72 ([blog](https://lmsys.org/blog/2026-02-20-gb300-inferencex/)).
-- [2026/01] 🔥 SGLang Diffusion accelerates video and image generation ([blog](https://lmsys.org/blog/2026-01-16-sglang-diffusion/)).
-- [2025/12] SGLang provides day-0 support for latest open models ([MiMo-V2-Flash](https://lmsys.org/blog/2025-12-16-mimo-v2-flash/), [Nemotron 3 Nano](https://lmsys.org/blog/2025-12-15-run-nvidia-nemotron-3-nano/), [Mistral Large 3](https://github.com/sgl-project/sglang/pull/14213), [LLaDA 2.0 Diffusion LLM](https://lmsys.org/blog/2025-12-19-diffusion-llm/), [MiniMax M2](https://lmsys.org/blog/2025-11-04-miminmax-m2/)).
-- [2025/10] 🔥 SGLang now runs natively on TPU with the SGLang-Jax backend ([blog](https://lmsys.org/blog/2025-10-29-sglang-jax/)).
-- [2025/09] Deploying DeepSeek on GB200 NVL72 with PD and Large Scale EP (Part II): 3.8x Prefill, 4.8x Decode Throughput ([blog](https://lmsys.org/blog/2025-09-25-gb200-part-2/)).
-- [2025/09] SGLang Day 0 Support for DeepSeek-V3.2 with Sparse Attention ([blog](https://lmsys.org/blog/2025-09-29-deepseek-V32/)).
-- [2025/08] SGLang x AMD SF Meetup on 8/22: Hands-on GPU workshop, tech talks by AMD/xAI/SGLang, and networking ([Roadmap](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_sglang_roadmap.pdf), [Large-scale EP](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_sglang_ep.pdf), [Highlights](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_highlights.pdf), [AITER/MoRI](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_aiter_mori.pdf), [Wave](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_wave.pdf)).
+Use this for pure GPU baseline comparison:
 
-<details>
-<summary>More</summary>
+```bash
+env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+  -u all_proxy -u ALL_PROXY \
+  HOME=/home/binkma \
+  PYTHONPATH=python \
+  NO_PROXY=127.0.0.1,localhost \
+  no_proxy=127.0.0.1,localhost \
+  .venv/bin/python -m sglang.launch_server \
+  --model-path "$MODEL" \
+  --host 127.0.0.1 \
+  --port 31000 \
+  --attention-backend torch_native \
+  --disable-radix-cache \
+  --disable-cuda-graph \
+  --disable-piecewise-cuda-graph \
+  --max-running-requests 1 \
+  --max-total-tokens 12288 \
+  --mem-fraction-static 0.70
+```
 
-- [2025/11] SGLang Diffusion accelerates video and image generation ([blog](https://lmsys.org/blog/2025-11-07-sglang-diffusion/)).
-- [2025/10] PyTorch Conference 2025 SGLang Talk ([slide](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/sglang_pytorch_2025.pdf)).
-- [2025/10] SGLang x Nvidia SF Meetup on 10/2 ([recap](https://x.com/lmsysorg/status/1975339501934510231)).
-- [2025/08] SGLang provides day-0 support for OpenAI gpt-oss model ([instructions](https://github.com/sgl-project/sglang/issues/8833))
-- [2025/06] SGLang, the high-performance serving infrastructure powering trillions of tokens daily, has been awarded the third batch of the Open Source AI Grant by a16z ([a16z blog](https://a16z.com/advancing-open-source-ai-through-benchmarks-and-bold-experimentation/)).
-- [2025/05] Deploying DeepSeek with PD Disaggregation and Large-scale Expert Parallelism on 96 H100 GPUs ([blog](https://lmsys.org/blog/2025-05-05-large-scale-ep/)).
-- [2025/06] Deploying DeepSeek on GB200 NVL72 with PD and Large Scale EP (Part I): 2.7x Higher Decoding Throughput ([blog](https://lmsys.org/blog/2025-06-16-gb200-part-1/)).
-- [2025/03] Supercharge DeepSeek-R1 Inference on AMD Instinct MI300X ([AMD blog](https://rocm.blogs.amd.com/artificial-intelligence/DeepSeekR1-Part2/README.html))
-- [2025/03] SGLang Joins PyTorch Ecosystem: Efficient LLM Serving Engine ([PyTorch blog](https://pytorch.org/blog/sglang-joins-pytorch/))
-- [2025/02] Unlock DeepSeek-R1 Inference Performance on AMD Instinct™ MI300X GPU ([AMD blog](https://rocm.blogs.amd.com/artificial-intelligence/DeepSeekR1_Perf/README.html))
-- [2025/01] SGLang provides day one support for DeepSeek V3/R1 models on NVIDIA and AMD GPUs with DeepSeek-specific optimizations. ([instructions](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3), [AMD blog](https://www.amd.com/en/developer/resources/technical-articles/amd-instinct-gpus-power-deepseek-v3-revolutionizing-ai-development-with-sglang.html), [10+ other companies](https://x.com/lmsysorg/status/1887262321636221412))
-- [2024/12] v0.4 Release: Zero-Overhead Batch Scheduler, Cache-Aware Load Balancer, Faster Structured Outputs ([blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/)).
-- [2024/10] The First SGLang Online Meetup ([slides](https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#the-first-sglang-online-meetup)).
-- [2024/09] v0.3 Release: 7x Faster DeepSeek MLA, 1.5x Faster torch.compile, Multi-Image/Video LLaVA-OneVision ([blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/)).
-- [2024/07] v0.2 Release: Faster Llama3 Serving with SGLang Runtime (vs. TensorRT-LLM, vLLM) ([blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/)).
-- [2024/02] SGLang enables **3x faster JSON decoding** with compressed finite state machine ([blog](https://lmsys.org/blog/2024-02-05-compressed-fsm/)).
-- [2024/01] SGLang provides up to **5x faster inference** with RadixAttention ([blog](https://lmsys.org/blog/2024-01-17-sglang/)).
-- [2024/01] SGLang powers the serving of the official **LLaVA v1.6** release demo ([usage](https://github.com/haotian-liu/LLaVA?tab=readme-ov-file#demo)).
+## Benchmark Requests
 
-</details>
+Run prompt-length and generation-length sweeps against a running server:
 
-## About
-SGLang is a high-performance serving framework for large language models and multimodal models.
-It is designed to deliver low-latency and high-throughput inference across a wide range of setups, from a single GPU to large distributed clusters.
-Its core features include:
+```bash
+env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+  -u all_proxy -u ALL_PROXY \
+  NO_PROXY=127.0.0.1,localhost \
+  no_proxy=127.0.0.1,localhost \
+  HOME=/home/binkma \
+  PYTHONPATH=python \
+  .venv/bin/python - <<'PY'
+import time
 
-- **Fast Runtime**: Provides efficient serving with RadixAttention for prefix caching, a zero-overhead CPU scheduler, prefill-decode disaggregation, speculative decoding, continuous batching, paged attention, tensor/pipeline/expert/data parallelism, structured outputs, chunked prefill, quantization (FP4/FP8/INT4/AWQ/GPTQ), and multi-LoRA batching.
-- **Broad Model Support**: Supports a wide range of language models (Llama, Qwen, DeepSeek, Kimi, GLM, GPT, Gemma, Mistral, etc.), embedding models (e5-mistral, gte, mcdse), reward models (Skywork), and diffusion models (WAN, Qwen-Image), with easy extensibility for adding new models. Compatible with most Hugging Face models and OpenAI APIs.
-- **Extensive Hardware Support**: Runs on NVIDIA GPUs (GB200/B300/H100/A100/Spark/5090), AMD GPUs (MI355/MI300), Intel Xeon CPUs, Google TPUs, Ascend NPUs, and more.
-- **Active Community**: SGLang is open-source and supported by a vibrant community with widespread industry adoption, powering over 400,000 GPUs worldwide.
-- **RL & Post-Training Backbone**: SGLang is a proven rollout backend used for training many frontier models, with native RL integrations and adoption by well-known post-training frameworks such as [**AReaL**](https://github.com/inclusionAI/AReaL), [**Miles**](https://github.com/radixark/miles), [**slime**](https://github.com/THUDM/slime), [**Tunix**](https://github.com/google/tunix), [**verl**](https://github.com/volcengine/verl) and more.
+import requests
+from transformers import AutoTokenizer
 
-## Getting Started
-- [Install SGLang](https://docs.sglang.io/get_started/install.html)
-- [Quick Start](https://docs.sglang.io/basic_usage/send_request.html)
-- [Backend Tutorial](https://docs.sglang.io/basic_usage/openai_api_completions.html)
-- [Frontend Tutorial](https://docs.sglang.io/references/frontend/frontend_tutorial.html)
-- [Contribution Guide](https://docs.sglang.io/developer_guide/contribution_guide.html)
+model = "/grand/hp-ptycho/binkma/HFmodel/hub/models--Qwen--Qwen2.5-Coder-3B/snapshots/09d9bc5d376b0cfa0100a0694ea7de7232525803"
+tok = AutoTokenizer.from_pretrained(model, trust_remote_code=False)
+token_id = tok.encode(" hello", add_special_tokens=False)[0]
+url = "http://127.0.0.1:31000/generate"
 
-## Benchmark and Performance
-Learn more in the release blogs: [v0.2 blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/), [v0.3 blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/), [v0.4 blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/), [Large-scale expert parallelism](https://lmsys.org/blog/2025-05-05-large-scale-ep/), [GB200 rack-scale parallelism](https://lmsys.org/blog/2025-09-25-gb200-part-2/), [GB300 long context](https://lmsys.org/blog/2026-02-19-gb300-longctx/).
+params = {
+    "max_new_tokens": 1024,
+    "temperature": 0,
+    "ignore_eos": True,
+}
 
-## Adoption and Sponsorship
-SGLang has been deployed at large scale, generating trillions of tokens in production each day. It is trusted and adopted by a wide range of leading enterprises and institutions, including xAI, AMD, NVIDIA, Intel, LinkedIn, Cursor, Oracle Cloud, Google Cloud, Microsoft Azure, AWS, Atlas Cloud, Voltage Park, Nebius, DataCrunch, Novita, InnoMatrix, MIT, UCLA, the University of Washington, Stanford, UC Berkeley, Tsinghua University, Jam & Tea Studios, Baseten, and other major technology organizations.
-As an open-source LLM inference engine, SGLang has become the de facto industry standard, with deployments running on over 400,000 GPUs worldwide.
-SGLang is currently hosted under the non-profit open-source organization [LMSYS](https://lmsys.org/about/).
+for prompt_len in (128, 512):
+    payload = {
+        "input_ids": [token_id] * prompt_len,
+        "sampling_params": params,
+    }
+    t0 = time.perf_counter()
+    response = requests.post(url, json=payload, timeout=600)
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    meta = response.json().get("meta_info", {})
+    completion_tokens = meta.get("completion_tokens", 0)
+    tok_per_s = completion_tokens / (elapsed_ms / 1000)
+    print(
+        "RESULT",
+        prompt_len,
+        "gen=1024",
+        f"latency_ms={elapsed_ms:.1f}",
+        f"tok_per_s={tok_per_s:.2f}",
+        "status=" + str(response.status_code),
+        "completion_tokens=" + str(completion_tokens),
+    )
+PY
+```
 
-<img src="https://raw.githubusercontent.com/sgl-project/sgl-learning-materials/refs/heads/main/slides/adoption.png" alt="logo" width="800" margin="10px"></img>
+For a short smoke test, change `max_new_tokens` to `32` and prompt lengths to
+`2048, 4096, 8192`.
 
-## Contact Us
-For enterprises interested in adopting or deploying SGLang at scale, including technical consulting, sponsorship opportunities, or partnership inquiries, please contact us at [sglang@lmsys.org](mailto:sglang@lmsys.org).
+## Decode Profiling
 
-Long-term active SGLang contributors are eligible for coding agent sponsorship, such as Cursor, Claude Code, or OpenAI Codex. Email [sglang@lmsys.org](mailto:sglang@lmsys.org) with your most important commits or pull requests.
+Profiling is disabled by default. Enable it when you need time attribution:
 
-## Acknowledgment
-We learned the design and reused code from the following projects: [Guidance](https://github.com/guidance-ai/guidance), [vLLM](https://github.com/vllm-project/vllm), [LightLLM](https://github.com/ModelTC/lightllm), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [Outlines](https://github.com/outlines-dev/outlines), and [LMQL](https://github.com/eth-sri/lmql).
+```bash
+SGLANG_HYBRIDGEN_PROFILE=1 \
+SGLANG_HYBRIDGEN_PROFILE_INTERVAL=64 \
+env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+  -u all_proxy -u ALL_PROXY \
+  HOME=/home/binkma \
+  PYTHONPATH=python \
+  NO_PROXY=127.0.0.1,localhost \
+  no_proxy=127.0.0.1,localhost \
+  .venv/bin/python -m sglang.launch_server \
+  --model-path "$MODEL" \
+  --host 127.0.0.1 \
+  --port 31000 \
+  --attention-backend hybrid_kvcache \
+  --disable-radix-cache \
+  --disable-cuda-graph \
+  --disable-piecewise-cuda-graph \
+  --max-running-requests 1 \
+  --max-total-tokens 12288 \
+  --mem-fraction-static 0.70 \
+  --hybridgen-gpu-cache-factor 0.1 \
+  --hybridgen-min-gpu-recent-tokens 512 \
+  --hybridgen-topk-ratio 0.05 \
+  --hybridgen-cpu-k-cap 2048 \
+  --hybridgen-feedback-interval 4 \
+  --hybridgen-host-ratio 2.0 \
+  --hybridgen-host-layout layer_first
+```
+
+The profile log reports per-layer averages for:
+
+- `decode_total/layer`
+- `q_to_cpu/layer`
+- `cpu_topk/layer`
+- `host_v_gather/layer`
+- `h2d/layer`
+- `gpu_attn_or_merge/layer`
+- `gpu_partial/layer`
+- `evict_total/batch`, `evict_backup/batch`, `evict_release/batch`
+- average `cpu_len`, `effective_cpu_len`, `gpu_len`, and `topk`
+
+Profiling inserts GPU synchronization around measured regions, so use it for
+attribution rather than throughput numbers.
+
+## Current Results
+
+Measured on A100-40GB with Qwen2.5-Coder-3B, batch size 1, CUDA graph disabled,
+radix cache disabled, and `max_new_tokens=1024`.
+
+| Prompt tokens | Backend | Latency | Throughput |
+|---:|---|---:|---:|
+| 128 | `torch_native` | 23.16 s | 44.22 tok/s |
+| 128 | `hybrid_kvcache`, `min_gpu_recent=512` | 35.40 s | 28.92 tok/s |
+| 512 | `torch_native` | 23.03 s | 44.46 tok/s |
+| 512 | `hybrid_kvcache`, `min_gpu_recent=512` | 43.19 s | 23.71 tok/s |
+
+The minimum GPU recent window fixes the short-prompt long-generation policy
+issue: prompt 128 and prompt 512 both keep a 512-token GPU dense segment after
+offload starts, instead of only 12 or 51 tokens with the old factor-only rule.
+The remaining gap versus pure GPU is mostly the host path: CPU top-k, host V
+gather, H2D transfer, and feedback increasing top-k ratio as the host segment
+grows.
+
+## Repository Notes
+
+`INTEGRATION.md` is treated as a local scratch/design note and is ignored by
+git. Keep user-facing instructions in this README.
