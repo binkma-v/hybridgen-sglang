@@ -597,6 +597,7 @@ class ServerArgs:
     hybridgen_topk_ratio: float = 0.05
     hybridgen_cpu_k_cap: int = 2048
     hybridgen_gpu_cache_factor: float = 1.0
+    hybridgen_min_gpu_recent_tokens: int = 512
     hybridgen_feedback_interval: int = 0
     hybridgen_gpu_q_proj: bool = True
     hybridgen_host_size: int = 0
@@ -4708,6 +4709,13 @@ class ServerArgs:
             help="HybridGen: GPU cache size multiplier relative to prompt_len "
             "(matches hybridgen's --gpu-cache-factor; default 1.0 = GPU holds whole prompt, "
             "evict only when decode grows beyond it; <1.0 evicts part of prompt during prefill).",
+        )
+        parser.add_argument(
+            "--hybridgen-min-gpu-recent-tokens",
+            type=int,
+            default=ServerArgs.hybridgen_min_gpu_recent_tokens,
+            help="HybridGen: minimum number of recent KV tokens kept on GPU "
+            "regardless of prompt_len * gpu_cache_factor (default 512; 0 disables).",
         )
         parser.add_argument(
             "--hybridgen-feedback-interval",

@@ -513,7 +513,7 @@ DoubleSparseAttnBackend 是 enable 通过 feature flag (`enable_double_sparsity`
 
 ```
 HybridKVCacheAttnBackend(AttentionBackend)
-├── __init__                          读 9 个 hybridgen_* 配置；构造 fallback (TorchNativeAttnBackend)
+├── __init__                          读 10 个 hybridgen_* 配置；构造 fallback (TorchNativeAttnBackend)
 ├── _build_feedback_controller        从 model_config 读 D / N_HEADS / N_LAYERS 构造 estimator
 ├── _ensure_host_pool                 从 forward_batch.token_to_kv_pool 懒构造 MHATokenToKVPoolHost
 ├── _alloc_host / _free_host          page-aligned 分配
@@ -611,11 +611,12 @@ def create_hybrid_kvcache_backend(runner):
 三处修改：
 
 1. `ATTENTION_BACKEND_CHOICES` 列表加 `"hybrid_kvcache"`
-2. 数据类字段段加 9 个 `hybridgen_*` 配置（仿 `enable_double_sparsity` 模式）：
+2. 数据类字段段加 10 个 `hybridgen_*` 配置（仿 `enable_double_sparsity` 模式）：
    ```
    hybridgen_topk_ratio: float = 0.05
    hybridgen_cpu_k_cap: int = 2048
    hybridgen_gpu_cache_factor: float = 1.0
+   hybridgen_min_gpu_recent_tokens: int = 512
    hybridgen_feedback_interval: int = 0
    hybridgen_gpu_q_proj: bool = True
    hybridgen_host_size: int = 0
@@ -623,7 +624,7 @@ def create_hybrid_kvcache_backend(runner):
    hybridgen_host_layout: str = "layer_first"
    hybridgen_io_backend: str = "kernel"
    ```
-3. argparse 段加对应 9 个 `--hybridgen-*` flag
+3. argparse 段加对应 10 个 `--hybridgen-*` flag
 
 ### 6.5 关键工程问题与解法
 
@@ -924,7 +925,7 @@ HybridKVCacheAttnBackend feedback: topk_ratio 0.0720 -> 0.0864, cpu_k_cap 0 -> 0
 | `_maybe_evict_per_request` 实际触发 | ✅ cpu_len 增长可见 |
 | `backup_from_device_all_layer` 不报错 | ✅ tensor format 修补后 |
 | `_maybe_step_feedback` 实际触发 | ✅ topk_ratio 实时上调 |
-| 9 个 `--hybridgen-*` CLI 选项可见 | ✅ `--help` 输出 |
+| 10 个 `--hybridgen-*` CLI 选项可见 | ✅ `--help` 输出 |
 
 ### 8.3 修复后 2k / 4k / 8k benchmark
 
@@ -935,7 +936,7 @@ HybridKVCacheAttnBackend feedback: topk_ratio 0.0720 -> 0.0864, cpu_k_cap 0 -> 0
   `/grand/hp-ptycho/binkma/HFmodel/hub/models--Qwen--Qwen2.5-Coder-3B/snapshots/09d9bc5d376b0cfa0100a0694ea7de7232525803`
 - 请求：`input_ids` 直传，`max_new_tokens=32`，`temperature=0`，`ignore_eos=true`
 - 公共启动参数：`--disable-radix-cache --disable-cuda-graph --disable-piecewise-cuda-graph --max-running-requests 1 --max-total-tokens 12288 --mem-fraction-static 0.70`
-- Hybrid 参数：`--hybridgen-gpu-cache-factor 0.1 --hybridgen-topk-ratio 0.05 --hybridgen-cpu-k-cap 2048 --hybridgen-feedback-interval 4 --hybridgen-host-ratio 2.0 --hybridgen-host-layout layer_first`
+- Hybrid 参数：`--hybridgen-gpu-cache-factor 0.1 --hybridgen-min-gpu-recent-tokens 512 --hybridgen-topk-ratio 0.05 --hybridgen-cpu-k-cap 2048 --hybridgen-feedback-interval 4 --hybridgen-host-ratio 2.0 --hybridgen-host-layout layer_first`
 
 | Prompt tokens | torch_native | hybrid_kvcache<br>(cap 修复后) | hybrid_kvcache<br>(unique/workspace 后) | hybrid_kvcache<br>(Triton fused 后) | hybrid_kvcache<br>(guarded overlap 后) | hybrid:native | 输出 |
 |---:|---:|---:|---:|---:|---:|---:|---|
@@ -957,6 +958,32 @@ Hybrid 日志证据：
 - 去掉 `torch.unique + scatter_` 并复用 top-k workspace 后，8k 进一步从 `3.42s` 降到 `2.13s`；2k/4k 也分别降到 `1.87s` / `1.95s`。
 - Triton fused merged-softmax 后，8k 进一步降到 `1.99s`；2k/4k 分别为 `1.72s` / `1.81s`。剩余 gap 主要来自 CPU top-k eager 路径、每层 CPU/GPU 同步和 host→device top-k V 传输。
 - guarded overlap 后，latest 2k/4k/8k 为 `1.74s` / `1.84s` / `2.02s`。实测未加 guard 的 CPU/GPU partial overlap 为 `1.91s` / `2.02s` / `2.22s`，说明默认 `cpu_k_cap=2048` 下拆 kernel 不划算；最终实现只在 `effective_cpu_len >= 4096` 且 GPU dense segment `>= 1024` 时启用两阶段 CPU/GPU overlap。
+
+### 8.4 短 prompt / 长生成 benchmark
+
+真实目标场景更接近短 prompt（50-500 token）+ 长生成。原来的 `gpu_cap = prompt_len * gpu_cache_factor` 会在 `factor=0.1` 时让 prompt=128 只保留 12 个 GPU token、prompt=512 只保留 51 个 GPU token，导致 decode 几乎完全走 host path。
+
+因此加入 `--hybridgen-min-gpu-recent-tokens`，GPU residency cap 变成：
+
+```python
+gpu_cap = max(int(prompt_len * gpu_cache_factor), min_gpu_recent_tokens, 1)
+```
+
+默认 `min_gpu_recent_tokens=512`；设为 0 可恢复旧语义。实测日志确认 prompt=128 / prompt=512 在长生成进入 offload 后都保持 `gpu_len=512`。
+
+环境同 §8.3，`max_new_tokens=1024`，禁用 CUDA graph，`--disable-radix-cache`，batch size 1：
+
+| Prompt tokens | Backend | gen tokens | latency | throughput | 说明 |
+|---:|---|---:|---:|---:|---|
+| 128 | torch_native | 1024 | 23.16 s | 44.22 tok/s | 纯 GPU dense baseline |
+| 128 | hybrid_kvcache (`min_gpu_recent=512`) | 1024 | 35.40 s | 28.92 tok/s | 约 1.53× slower；进入 offload 前与 GPU 接近，host 段增长后约 22-23 tok/s |
+| 512 | torch_native | 1024 | 23.03 s | 44.46 tok/s | 纯 GPU dense baseline |
+| 512 | hybrid_kvcache (`min_gpu_recent=512`) | 1024 | 43.19 s | 23.71 tok/s | 约 1.88× slower；GPU recent window 保持 512 |
+
+结论：
+- `min_gpu_recent=512` 修正了短 prompt 长生成时过度 offload 的策略问题：GPU dense segment 不再只有 12/51 token。
+- 但 hybrid 仍慢于纯 GPU，剩余瓶颈是 host path 整体：CPU top-k、host V gather、H2D，以及 feedback 在短 prompt 下把 `topk_ratio` 推到较高区间后的 top-k V 传输。
+- 如果目标是性能接近纯 GPU，需要进一步调短 prompt 长生成的 feedback policy（避免 `topk_ratio` 长时间冲到 0.5），或在显存允许时把 `min_gpu_recent_tokens` 提到 1024。
 
 ---
 
@@ -1052,7 +1079,7 @@ fused_merged_attention_kernel(
 | `test/registered/unit/layers/test_hybridgen_topk.py` | 新建 | 102 | workspace 复用与 per-head V merged attention 单测 |
 | `test/registered/unit/mem_cache/test_hybridgen_release.py` | 新建 | 128 | shadow release helper 与幂等释放单测 |
 | `python/sglang/srt/layers/attention/attention_registry.py` | 修改 | +9 | 注册 `hybrid_kvcache` 工厂 |
-| `python/sglang/srt/server_args.py` | 修改 | +68 | 加 9 个 hybridgen_* CLI 字段 + argparse |
+| `python/sglang/srt/server_args.py` | 修改 | +68 | 加 10 个 hybridgen_* CLI 字段 + argparse |
 | `python/sglang/srt/managers/schedule_batch.py` | 修改 | +2 | 向 worker batch 传递 `cache_protected_len` |
 | `python/sglang/srt/model_executor/forward_batch_info.py` | 修改 | +2 | `ForwardBatch` 携带 `cache_protected_lens` |
 | `python/sglang/srt/mem_cache/chunk_cache.py` | 修改 | +11 | cleanup 过滤 released sentinel，避免 double-free |
@@ -1160,6 +1187,7 @@ fused_merged_attention_kernel(
 --hybridgen-topk-ratio FLOAT          top-k / cpu_cache_len 比例 (默认 0.05)
 --hybridgen-cpu-k-cap INT             CPU K 扫描窗口上限 (默认 2048；0=初始不限，feedback 可收紧)
 --hybridgen-gpu-cache-factor FLOAT    GPU 段大小 / prompt_len (默认 1.0)
+--hybridgen-min-gpu-recent-tokens INT 至少保留的 GPU recent KV 数 (默认 512；0=关闭)
 --hybridgen-feedback-interval INT     反馈步数 (0=关闭) (默认 0)
 --hybridgen-gpu-q-proj                Q 在 GPU 投影后再 copy (默认 True)
 --hybridgen-host-size INT             host pool 大小 GB (0=用 ratio)

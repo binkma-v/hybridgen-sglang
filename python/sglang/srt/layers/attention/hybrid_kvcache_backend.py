@@ -62,6 +62,7 @@ class HybridKVCacheAttnBackend(AttentionBackend):
         self._initial_topk_ratio: float = self.topk_ratio
         self._initial_cpu_k_cap: int = self.cpu_k_cap
         self.gpu_cache_factor: float = sa.hybridgen_gpu_cache_factor
+        self.min_gpu_recent_tokens: int = sa.hybridgen_min_gpu_recent_tokens
         self.feedback_interval: int = sa.hybridgen_feedback_interval
         self.gpu_q_proj: bool = sa.hybridgen_gpu_q_proj
         self.host_size_gb: int = sa.hybridgen_host_size
@@ -331,6 +332,18 @@ class HybridKVCacheAttnBackend(AttentionBackend):
         if self.cpu_k_cap > 0:
             return min(n_host, self.cpu_k_cap)
         return n_host
+
+    @staticmethod
+    def _gpu_residency_cap(
+        prompt_len: int,
+        gpu_cache_factor: float,
+        min_gpu_recent_tokens: int,
+    ) -> int:
+        return max(
+            int(prompt_len * gpu_cache_factor),
+            max(int(min_gpu_recent_tokens), 0),
+            1,
+        )
 
     def _q_to_kv_heads(self, num_q_heads: int, num_kv_heads: int) -> torch.Tensor:
         key = (num_q_heads, num_kv_heads)
@@ -608,9 +621,12 @@ class HybridKVCacheAttnBackend(AttentionBackend):
                 self._prompt_lens[req_pool_idx] = max(existing, seq_len)
 
             prompt_len = self._prompt_lens[req_pool_idx]
-            # gpu_cache_factor is the fraction of prompt KV kept on GPU.
-            # cap = factor * prompt_len, with a minimum of 1 to avoid 0-cap.
-            gpu_cap = max(int(self.gpu_cache_factor * prompt_len), 1)
+            # Keep a factor-sized prompt window, but also preserve a minimum
+            # recent decode window on GPU for short-prompt long-generation
+            # workloads.
+            gpu_cap = self._gpu_residency_cap(
+                prompt_len, self.gpu_cache_factor, self.min_gpu_recent_tokens
+            )
 
             n_host = len(self._host_segments.get(req_pool_idx, ()))
             self._release_existing_host_shadows(

@@ -45,6 +45,7 @@ python -m sglang.launch_server \
   --disable-cuda-graph \
   --disable-piecewise-cuda-graph \
   --hybridgen-gpu-cache-factor 0.1 \
+  --hybridgen-min-gpu-recent-tokens 512 \
   --hybridgen-topk-ratio 0.05 \
   --hybridgen-cpu-k-cap 2048 \
   --hybridgen-feedback-interval 4 \
