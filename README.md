@@ -32,7 +32,7 @@ Implemented work in this fork:
 - Host KV storage through SGLang's `MHATokenToKVPoolHost`.
 - GPU KV shadow release for request-owned offloaded tokens, with released-slot cleanup protections in chunk/radix cache paths.
 - Adaptive `topk_ratio` / `cpu_k_cap` feedback policy, with default `cpu_k_cap=2048`.
-- Decode hot-path optimizations: grouped CPU bmm, reusable top-k workspace, per-head V gather without `torch.unique`, a Triton fused merged-softmax kernel, and guarded side-stream H2D copy overlap for larger top-k transfers.
+- Decode hot-path optimizations: grouped CPU bmm, reusable top-k workspace, per-head V gather without `torch.unique`, a Triton fused merged-softmax kernel, guarded side-stream H2D copy overlap, and guarded CPU/GPU partial-attention overlap for larger cap settings.
 - Unit tests for release semantics, feedback cap behavior, CPU top-k workspace reuse, and Triton fused attention equivalence.
 
 Example launch:
@@ -52,7 +52,7 @@ python -m sglang.launch_server \
   --hybridgen-host-layout layer_first
 ```
 
-On A100-40GB with Qwen2.5-Coder-3B, forced eviction (`gpu_cache_factor=0.1`) and 32-token decode completed successfully for 2k/4k/8k prompts. The optimized hybrid path measured approximately 1.81s / 1.80s / 1.99s respectively in the latest guarded-overlap run, down from 20.9s at 8k before cap/workspace/fused-kernel fixes.
+On A100-40GB with Qwen2.5-Coder-3B, forced eviction (`gpu_cache_factor=0.1`) and 32-token decode completed successfully for 2k/4k/8k prompts. The optimized hybrid path measured approximately 1.74s / 1.84s / 2.02s respectively in the latest guarded-overlap run, down from 20.9s at 8k before cap/workspace/fused-kernel fixes.
 
 For the full design, implementation notes, benchmark commands, and remaining follow-ups, see [INTEGRATION.md](INTEGRATION.md).
 

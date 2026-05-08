@@ -135,6 +135,126 @@ def _merged_softmax_attention_per_head_v_kernel(
     )
 
 
+@triton.jit(do_not_specialize=["s_gpu"])
+def _gpu_dense_attention_partial_kernel(
+    q_ptr,
+    k_gpu_ptr,
+    v_gpu_ptr,
+    max_ptr,
+    denom_ptr,
+    acc_ptr,
+    s_gpu,
+    num_q_heads: tl.constexpr,
+    num_kv_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    scaling: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    q_head = tl.program_id(0)
+    q_per_kv = num_q_heads // num_kv_heads
+    kv_head = q_head // q_per_kv
+
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_D)
+    n_mask = offs_n < s_gpu
+    d_mask = offs_d < head_dim
+
+    q_vals = tl.load(
+        q_ptr + q_head * head_dim + offs_d,
+        mask=d_mask,
+        other=0.0,
+    ).to(tl.float32)
+    k_vals = tl.load(
+        k_gpu_ptr
+        + offs_n[:, None] * (num_kv_heads * head_dim)
+        + kv_head * head_dim
+        + offs_d[None, :],
+        mask=n_mask[:, None] & d_mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    logits = tl.sum(k_vals * q_vals[None, :], axis=1) * scaling
+    logits = tl.where(n_mask, logits, -float("inf"))
+
+    max_logit = tl.max(logits, axis=0)
+    weights = tl.exp(logits - max_logit)
+    weights = tl.where(n_mask, weights, 0.0)
+    denom = tl.sum(weights, axis=0)
+
+    v_vals = tl.load(
+        v_gpu_ptr
+        + offs_n[:, None] * (num_kv_heads * head_dim)
+        + kv_head * head_dim
+        + offs_d[None, :],
+        mask=n_mask[:, None] & d_mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    acc = tl.sum(weights[:, None] * v_vals, axis=0)
+
+    tl.store(max_ptr + q_head, max_logit)
+    tl.store(denom_ptr + q_head, denom)
+    tl.store(
+        acc_ptr + q_head * head_dim + offs_d,
+        acc,
+        mask=d_mask,
+    )
+
+
+@triton.jit(do_not_specialize=["k_eff"])
+def _merge_gpu_partial_with_topk_kernel(
+    gpu_max_ptr,
+    gpu_denom_ptr,
+    gpu_acc_ptr,
+    cpu_scores_ptr,
+    v_topk_ptr,
+    out_ptr,
+    k_eff,
+    head_dim: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    q_head = tl.program_id(0)
+
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_d = tl.arange(0, BLOCK_D)
+    k_mask = offs_k < k_eff
+    d_mask = offs_d < head_dim
+
+    cpu_scores = tl.load(
+        cpu_scores_ptr + q_head * k_eff + offs_k,
+        mask=k_mask,
+        other=-float("inf"),
+    ).to(tl.float32)
+    cpu_max = tl.max(cpu_scores, axis=0)
+    gpu_max = tl.load(gpu_max_ptr + q_head).to(tl.float32)
+    merged_max = tl.maximum(cpu_max, gpu_max)
+
+    cpu_weights = tl.exp(cpu_scores - merged_max)
+    cpu_weights = tl.where(k_mask, cpu_weights, 0.0)
+    cpu_denom = tl.sum(cpu_weights, axis=0)
+
+    gpu_scale = tl.exp(gpu_max - merged_max)
+    gpu_denom = tl.load(gpu_denom_ptr + q_head).to(tl.float32) * gpu_scale
+
+    v_topk = tl.load(
+        v_topk_ptr
+        + (q_head * k_eff + offs_k[:, None]) * head_dim
+        + offs_d[None, :],
+        mask=k_mask[:, None] & d_mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    cpu_acc = tl.sum(cpu_weights[:, None] * v_topk, axis=0)
+
+    gpu_acc = tl.load(
+        gpu_acc_ptr + q_head * head_dim + offs_d,
+        mask=d_mask,
+        other=0.0,
+    ).to(tl.float32) * gpu_scale
+
+    out = (gpu_acc + cpu_acc) / (gpu_denom + cpu_denom)
+    tl.store(out_ptr + q_head * head_dim + offs_d, out, mask=d_mask)
+
+
 def _maybe_repeat_kv(
     k: torch.Tensor, v: torch.Tensor, num_q_heads: int, num_kv_heads: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -354,6 +474,182 @@ def merged_softmax_attention_per_head_v(
 
     weights = torch.softmax(all_logits, dim=1).to(all_v_t.dtype)
     out = torch.bmm(weights.unsqueeze(1), all_v_t).squeeze(1)
+    return out
+
+
+def gpu_dense_attention_partial(
+    q: torch.Tensor,
+    k_gpu: torch.Tensor,
+    v_gpu: torch.Tensor,
+    num_q_heads: int,
+    num_kv_heads: int,
+    scaling: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute GPU dense attention partials for later merged softmax.
+
+    Returns per-Q-head `(max_logit, denom, weighted_v_sum)` where `denom` and
+    `weighted_v_sum` are relative to `max_logit`. The final CPU top-k merge can
+    combine these sufficient statistics without recomputing GPU QK.
+    """
+    s_gpu, n_kv, head_dim = k_gpu.shape
+    assert n_kv == num_kv_heads
+    assert v_gpu.shape == k_gpu.shape
+
+    k_g, v_g = _maybe_repeat_kv(k_gpu, v_gpu, num_q_heads, num_kv_heads)
+    q_b = q.unsqueeze(1) * scaling
+    k_b = k_g.permute(1, 2, 0)
+    logits = torch.bmm(q_b, k_b).squeeze(1).to(torch.float32)
+    max_logit = logits.max(dim=1).values
+    weights = torch.exp(logits - max_logit[:, None])
+    denom = weights.sum(dim=1)
+    acc = torch.bmm(
+        weights.unsqueeze(1), v_g.permute(1, 0, 2).to(torch.float32)
+    ).squeeze(1)
+    return max_logit, denom, acc
+
+
+def gpu_dense_attention_partial_triton(
+    q: torch.Tensor,
+    k_gpu: torch.Tensor,
+    v_gpu: torch.Tensor,
+    num_q_heads: int,
+    num_kv_heads: int,
+    scaling: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Triton fused GPU dense partial attention for overlap with CPU top-k."""
+    if not q.is_cuda or not k_gpu.is_cuda or not v_gpu.is_cuda:
+        return gpu_dense_attention_partial(
+            q, k_gpu, v_gpu, num_q_heads, num_kv_heads, scaling
+        )
+
+    s_gpu, n_kv, head_dim = k_gpu.shape
+    if (
+        s_gpu <= 0
+        or s_gpu > 4096
+        or n_kv != num_kv_heads
+        or q.shape != (num_q_heads, head_dim)
+        or v_gpu.shape != k_gpu.shape
+        or head_dim > 256
+        or num_q_heads % num_kv_heads != 0
+    ):
+        return gpu_dense_attention_partial(
+            q, k_gpu, v_gpu, num_q_heads, num_kv_heads, scaling
+        )
+
+    q = q.contiguous()
+    k_gpu = k_gpu.contiguous()
+    v_gpu = v_gpu.contiguous()
+
+    block_n = 1024 if s_gpu <= 1024 else triton.next_power_of_2(s_gpu)
+    block_d = triton.next_power_of_2(head_dim)
+    num_warps = 8 if block_n >= 1024 else 4
+    max_logit = torch.empty((num_q_heads,), device=q.device, dtype=torch.float32)
+    denom = torch.empty((num_q_heads,), device=q.device, dtype=torch.float32)
+    acc = torch.empty((num_q_heads, head_dim), device=q.device, dtype=torch.float32)
+    _gpu_dense_attention_partial_kernel[(num_q_heads,)](
+        q,
+        k_gpu,
+        v_gpu,
+        max_logit,
+        denom,
+        acc,
+        s_gpu,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        float(scaling),
+        BLOCK_N=block_n,
+        BLOCK_D=block_d,
+        num_warps=num_warps,
+    )
+    return max_logit, denom, acc
+
+
+def merge_gpu_partial_with_topk(
+    gpu_max: torch.Tensor,
+    gpu_denom: torch.Tensor,
+    gpu_acc: torch.Tensor,
+    cpu_topk_scores: torch.Tensor,
+    v_topk_per_head: torch.Tensor,
+) -> torch.Tensor:
+    """Merge GPU dense partials with CPU top-k logits/V using one softmax."""
+    topk_scores = cpu_topk_scores.to(torch.float32)
+    cpu_max = topk_scores.max(dim=1).values
+    merged_max = torch.maximum(cpu_max, gpu_max)
+
+    cpu_weights = torch.exp(topk_scores - merged_max[:, None])
+    cpu_denom = cpu_weights.sum(dim=1)
+    cpu_acc = torch.bmm(
+        cpu_weights.unsqueeze(1), v_topk_per_head.to(torch.float32)
+    ).squeeze(1)
+
+    gpu_scale = torch.exp(gpu_max - merged_max)
+    denom = gpu_denom * gpu_scale + cpu_denom
+    acc = gpu_acc * gpu_scale[:, None] + cpu_acc
+    return (acc / denom[:, None]).to(v_topk_per_head.dtype)
+
+
+def merge_gpu_partial_with_topk_triton(
+    gpu_max: torch.Tensor,
+    gpu_denom: torch.Tensor,
+    gpu_acc: torch.Tensor,
+    cpu_topk_scores: torch.Tensor,
+    v_topk_per_head: torch.Tensor,
+) -> torch.Tensor:
+    """Triton fused final merge for GPU partial + CPU top-k attention."""
+    if (
+        not gpu_max.is_cuda
+        or not gpu_denom.is_cuda
+        or not gpu_acc.is_cuda
+        or not cpu_topk_scores.is_cuda
+        or not v_topk_per_head.is_cuda
+    ):
+        return merge_gpu_partial_with_topk(
+            gpu_max, gpu_denom, gpu_acc, cpu_topk_scores, v_topk_per_head
+        )
+
+    num_q_heads, k_eff = cpu_topk_scores.shape
+    head_dim = gpu_acc.shape[1]
+    if (
+        k_eff <= 0
+        or k_eff > 4096
+        or gpu_max.shape != (num_q_heads,)
+        or gpu_denom.shape != (num_q_heads,)
+        or gpu_acc.shape != (num_q_heads, head_dim)
+        or v_topk_per_head.shape != (num_q_heads, k_eff, head_dim)
+        or head_dim > 256
+    ):
+        return merge_gpu_partial_with_topk(
+            gpu_max, gpu_denom, gpu_acc, cpu_topk_scores, v_topk_per_head
+        )
+
+    gpu_max = gpu_max.contiguous()
+    gpu_denom = gpu_denom.contiguous()
+    gpu_acc = gpu_acc.contiguous()
+    cpu_topk_scores = cpu_topk_scores.contiguous()
+    v_topk_per_head = v_topk_per_head.contiguous()
+
+    block_k = 1024 if k_eff <= 1024 else triton.next_power_of_2(k_eff)
+    block_d = triton.next_power_of_2(head_dim)
+    num_warps = 8 if block_k >= 1024 else 4
+    out = torch.empty(
+        (num_q_heads, head_dim),
+        device=v_topk_per_head.device,
+        dtype=v_topk_per_head.dtype,
+    )
+    _merge_gpu_partial_with_topk_kernel[(num_q_heads,)](
+        gpu_max,
+        gpu_denom,
+        gpu_acc,
+        cpu_topk_scores,
+        v_topk_per_head,
+        out,
+        k_eff,
+        head_dim,
+        BLOCK_K=block_k,
+        BLOCK_D=block_d,
+        num_warps=num_warps,
+    )
     return out
 
 

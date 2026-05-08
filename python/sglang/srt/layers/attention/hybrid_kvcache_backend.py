@@ -18,6 +18,8 @@ from sglang.srt.layers.attention.hybridgen_feedback import (
 from sglang.srt.layers.attention.hybridgen_topk import (
     CPUTopKWorkspace,
     compute_topk_on_cpu,
+    gpu_dense_attention_partial_triton,
+    merge_gpu_partial_with_topk_triton,
     merged_softmax_attention_per_head_v_triton,
 )
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
@@ -100,11 +102,15 @@ class HybridKVCacheAttnBackend(AttentionBackend):
         self._q_to_kv_head_cache: Dict[tuple[int, int], torch.Tensor] = {}
         self._q_to_kv_topk_head_cache: Dict[tuple[int, int, int], torch.Tensor] = {}
         self._h2d_stream: Optional[torch.cuda.Stream] = None
+        self._gpu_overlap_stream: Optional[torch.cuda.Stream] = None
         self._pinned_scores: Optional[torch.Tensor] = None
         self._pinned_topk_v: Optional[torch.Tensor] = None
         self._h2d_overlap_min_bytes = 1 << 20
+        self._partial_overlap_min_cpu_tokens = 4096
+        self._partial_overlap_min_gpu_tokens = 1024
         if torch.device(self.device).type == "cuda":
             self._h2d_stream = torch.cuda.Stream(device=self.device)
+            self._gpu_overlap_stream = torch.cuda.Stream(device=self.device)
 
     # ------------------------------------------------------------------
     # Feedback scheduler bootstrap
@@ -353,6 +359,18 @@ class HybridKVCacheAttnBackend(AttentionBackend):
             v_topk_gpu.copy_(self._pinned_topk_v, non_blocking=True)
             copy_event.record(self._h2d_stream)
         return scores_gpu, v_topk_gpu, copy_event
+
+    def _should_overlap_gpu_partial(
+        self, n_host_scored: int, n_gpu_tokens: int
+    ) -> bool:
+        # Splitting the original fused attention into dense-partial + merge adds
+        # one kernel launch, one event wait, and global-memory partial traffic.
+        # It only pays off when CPU top-k has enough work to hide that overhead.
+        return (
+            self._gpu_overlap_stream is not None
+            and n_host_scored >= self._partial_overlap_min_cpu_tokens
+            and n_gpu_tokens >= self._partial_overlap_min_gpu_tokens
+        )
 
     def _can_release_device_slots(
         self, cache_protected_len: int, is_prefill: bool
@@ -768,6 +786,32 @@ class HybridKVCacheAttnBackend(AttentionBackend):
             n_host_scored = int(host_idx_tensor.shape[0])
             top_k = max(int(self.topk_ratio * n_host_scored), 1)
 
+            gpu_partial = None
+            gpu_partial_event = None
+            if self._should_overlap_gpu_partial(n_host_scored, per_req_tokens.numel()):
+                current_stream = torch.cuda.current_stream(device)
+                with torch.cuda.stream(self._gpu_overlap_stream):
+                    self._gpu_overlap_stream.wait_stream(current_stream)
+                    per_req_k = k_cache[
+                        per_req_tokens
+                    ]  # (S_gpu, nkv, qk_head_dim)
+                    per_req_v = v_cache[
+                        per_req_tokens
+                    ]  # (S_gpu, nkv, v_head_dim)
+                    if per_req_q.dtype != per_req_k.dtype:
+                        per_req_k = per_req_k.to(per_req_q.dtype)
+                        per_req_v = per_req_v.to(per_req_q.dtype)
+                    gpu_partial = gpu_dense_attention_partial_triton(
+                        per_req_q,
+                        per_req_k,
+                        per_req_v,
+                        nq,
+                        nkv,
+                        scaling,
+                    )
+                    gpu_partial_event = torch.cuda.Event()
+                    gpu_partial_event.record(self._gpu_overlap_stream)
+
             # Read host K for the segment (CPU tensor, model dtype).
             k_host_seg = self._host_pool.k_buffer[layer.layer_id, host_idx_tensor]
             # CPU top-k. Keep model dtype throughout (no float32 upcast):
@@ -793,33 +837,36 @@ class HybridKVCacheAttnBackend(AttentionBackend):
                 topk_scores_cpu, v_topk_host, device, per_req_q.dtype
             )
 
-            # Launch the GPU dense-segment gather after top-k H2D has been
-            # enqueued on the side stream, so these independent transfers can
-            # overlap. Keeping this after q_cpu avoids synchronizing the gather
-            # through the GPU->CPU Q copy.
-            per_req_k = k_cache[per_req_tokens]  # (S_gpu, nkv, qk_head_dim)
-            per_req_v = v_cache[per_req_tokens]  # (S_gpu, nkv, v_head_dim)
-
-            # Cast K/V to Q dtype if needed (matches torch_native fallback).
-            k_g = per_req_k
-            v_g = per_req_v
-            if per_req_q.dtype != k_g.dtype:
-                k_g = k_g.to(per_req_q.dtype)
-                v_g = v_g.to(per_req_q.dtype)
-
             if topk_copy_event is not None:
                 torch.cuda.current_stream(device).wait_event(topk_copy_event)
 
-            out_seq = merged_softmax_attention_per_head_v_triton(
-                per_req_q,
-                k_g,
-                v_g,
-                scores_gpu,
-                v_topk_gpu,
-                nq,
-                nkv,
-                scaling,
-            )
+            if gpu_partial_event is not None:
+                torch.cuda.current_stream(device).wait_event(gpu_partial_event)
+
+            if gpu_partial is not None:
+                out_seq = merge_gpu_partial_with_topk_triton(
+                    gpu_partial[0],
+                    gpu_partial[1],
+                    gpu_partial[2],
+                    scores_gpu,
+                    v_topk_gpu,
+                )
+            else:
+                per_req_k = k_cache[per_req_tokens]  # (S_gpu, nkv, qk_head_dim)
+                per_req_v = v_cache[per_req_tokens]  # (S_gpu, nkv, v_head_dim)
+                if per_req_q.dtype != per_req_k.dtype:
+                    per_req_k = per_req_k.to(per_req_q.dtype)
+                    per_req_v = per_req_v.to(per_req_q.dtype)
+                out_seq = merged_softmax_attention_per_head_v_triton(
+                    per_req_q,
+                    per_req_k,
+                    per_req_v,
+                    scores_gpu,
+                    v_topk_gpu,
+                    nq,
+                    nkv,
+                    scaling,
+                )
             out_view[seq_idx] = out_seq
 
         return output

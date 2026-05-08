@@ -5,6 +5,8 @@ import torch
 from sglang.srt.layers.attention.hybridgen_topk import (
     CPUTopKWorkspace,
     compute_topk_on_cpu,
+    gpu_dense_attention_partial_triton,
+    merge_gpu_partial_with_topk_triton,
     merged_softmax_attention,
     merged_softmax_attention_per_head_v,
     merged_softmax_attention_per_head_v_triton,
@@ -117,6 +119,36 @@ class TestHybridGenPerHeadMergedAttention(unittest.TestCase):
         )
         got = merged_softmax_attention_per_head_v_triton(
             q, k_gpu, v_gpu, topk_scores, v_topk, nq, nkv, scaling
+        )
+
+        self.assertTrue(torch.allclose(got, ref, atol=2e-2, rtol=2e-2))
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required for Triton")
+    def test_triton_partial_merge_matches_fused(self):
+        torch.manual_seed(3)
+        device = torch.device("cuda")
+        nq, nkv, head_dim = 8, 2, 64
+        gpu_len, k_eff = 65, 13
+        scaling = head_dim**-0.5
+
+        q = torch.randn(nq, head_dim, dtype=torch.bfloat16, device=device)
+        k_gpu = torch.randn(gpu_len, nkv, head_dim, dtype=torch.bfloat16, device=device)
+        v_gpu = torch.randn(gpu_len, nkv, head_dim, dtype=torch.bfloat16, device=device)
+        topk_scores = torch.randn(nq, k_eff, dtype=torch.bfloat16, device=device)
+        v_topk = torch.randn(nq, k_eff, head_dim, dtype=torch.bfloat16, device=device)
+
+        ref = merged_softmax_attention_per_head_v_triton(
+            q, k_gpu, v_gpu, topk_scores, v_topk, nq, nkv, scaling
+        )
+        gpu_partial = gpu_dense_attention_partial_triton(
+            q, k_gpu, v_gpu, nq, nkv, scaling
+        )
+        got = merge_gpu_partial_with_topk_triton(
+            gpu_partial[0],
+            gpu_partial[1],
+            gpu_partial[2],
+            topk_scores,
+            v_topk,
         )
 
         self.assertTrue(torch.allclose(got, ref, atol=2e-2, rtol=2e-2))
