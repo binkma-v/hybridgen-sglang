@@ -964,6 +964,29 @@ Hybrid 日志证据：
 
 按重要性排序：
 
+### 9.0 Decode profiling
+
+为长生成场景加入了默认关闭的 profiling 开关：
+
+```bash
+SGLANG_HYBRIDGEN_PROFILE=1 \
+SGLANG_HYBRIDGEN_PROFILE_INTERVAL=64 \
+python -m sglang.launch_server ...
+```
+
+日志每 N 个 decode step 汇总一次 per-layer 平均时间：
+- `decode_total/layer`
+- `q_to_cpu/layer`
+- `cpu_topk/layer`
+- `host_v_gather/layer`
+- `h2d/layer`
+- `gpu_attn_or_merge/layer`
+- `gpu_partial/layer`
+- `evict_total/batch`, `evict_backup/batch`, `evict_release/batch`
+- 平均 `cpu_len` / `effective_cpu_len` / `gpu_len` / `topk`
+
+注意：profile 模式会在 GPU copy/kernel 周围插入同步，只用于时间归因，不用于最终吞吐 benchmark。对于真实 2k generated tokens，应该把 interval 设大一些（例如 64 或 128），观察 steady-state decode 均值；prefill/offload 是一次性成本，会被长 decode 摊薄。
+
 ### 9.1 实际释放 GPU 内存（论文卖点之一）
 
 当前已做第一版保守释放：decode 阶段、且请求没有 RadixCache-protected 共享前缀时，被驱逐 token 的 KV 在备份到 host 后会立刻归还 GPU KV allocator，并在 `req_to_token` 中标记为已释放，结束清理时跳过这些 slot，避免 double-free。

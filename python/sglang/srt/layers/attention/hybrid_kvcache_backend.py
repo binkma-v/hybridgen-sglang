@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import time
 from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
@@ -108,9 +110,71 @@ class HybridKVCacheAttnBackend(AttentionBackend):
         self._h2d_overlap_min_bytes = 1 << 20
         self._partial_overlap_min_cpu_tokens = 4096
         self._partial_overlap_min_gpu_tokens = 1024
+        self._profile_enabled = os.getenv("SGLANG_HYBRIDGEN_PROFILE", "0") == "1"
+        self._profile_interval = max(
+            int(os.getenv("SGLANG_HYBRIDGEN_PROFILE_INTERVAL", "8")), 1
+        )
+        self._profile_steps = 0
+        self._profile_stats: Dict[str, float] = {}
         if torch.device(self.device).type == "cuda":
             self._h2d_stream = torch.cuda.Stream(device=self.device)
             self._gpu_overlap_stream = torch.cuda.Stream(device=self.device)
+
+    def _profile_add(self, key: str, value: float) -> None:
+        if self._profile_enabled:
+            self._profile_stats[key] = self._profile_stats.get(key, 0.0) + value
+
+    def _profile_inc(self, key: str, value: int = 1) -> None:
+        if self._profile_enabled:
+            self._profile_stats[key] = self._profile_stats.get(key, 0.0) + value
+
+    def _profile_sync(self, device: torch.device) -> None:
+        if self._profile_enabled and torch.device(device).type == "cuda":
+            torch.cuda.synchronize(device)
+
+    def _profile_now(self) -> float:
+        return time.perf_counter()
+
+    def _profile_report_decode_step(self) -> None:
+        if not self._profile_enabled:
+            return
+        self._profile_steps += 1
+        if self._profile_steps % self._profile_interval != 0:
+            return
+
+        stats = self._profile_stats
+        layers = max(stats.get("decode_layers", 0.0), 1.0)
+        hybrid_reqs = max(stats.get("decode_hybrid_reqs", 0.0), 1.0)
+        evict_batches = max(stats.get("evict_batches", 0.0), 1.0)
+        logger.info(
+            "HybridGen profile last %d decode steps: "
+            "decode_total/layer=%.3f ms, q_to_cpu/layer=%.3f ms, "
+            "cpu_topk/layer=%.3f ms, host_v_gather/layer=%.3f ms, "
+            "h2d/layer=%.3f ms, gpu_attn_or_merge/layer=%.3f ms, "
+            "gpu_partial/layer=%.3f ms, hybrid_reqs=%.0f, "
+            "avg_cpu_len=%.1f, avg_effective_cpu_len=%.1f, avg_gpu_len=%.1f, "
+            "avg_topk=%.1f, evict_total/batch=%.3f ms, "
+            "evict_backup/batch=%.3f ms, evict_release/batch=%.3f ms, "
+            "evicted_tokens=%.0f",
+            self._profile_interval,
+            stats.get("decode_total_ms", 0.0) / layers,
+            stats.get("decode_q_to_cpu_ms", 0.0) / layers,
+            stats.get("decode_cpu_topk_ms", 0.0) / layers,
+            stats.get("decode_host_v_gather_ms", 0.0) / layers,
+            stats.get("decode_h2d_ms", 0.0) / layers,
+            stats.get("decode_gpu_attn_ms", 0.0) / layers,
+            stats.get("decode_gpu_partial_ms", 0.0) / layers,
+            stats.get("decode_hybrid_reqs", 0.0),
+            stats.get("decode_cpu_len", 0.0) / hybrid_reqs,
+            stats.get("decode_effective_cpu_len", 0.0) / hybrid_reqs,
+            stats.get("decode_gpu_len", 0.0) / hybrid_reqs,
+            stats.get("decode_topk", 0.0) / hybrid_reqs,
+            stats.get("evict_total_ms", 0.0) / evict_batches,
+            stats.get("evict_backup_ms", 0.0) / evict_batches,
+            stats.get("evict_release_ms", 0.0) / evict_batches,
+            stats.get("evict_tokens", 0.0),
+        )
+        self._profile_stats = {}
 
     # ------------------------------------------------------------------
     # Feedback scheduler bootstrap
@@ -605,12 +669,19 @@ class HybridKVCacheAttnBackend(AttentionBackend):
             else:
                 host_slots_arg = host_slots_cpu.to(dtype=gpu_slots.dtype)
 
+            evict_total_t0 = self._profile_now()
+            backup_t0 = evict_total_t0
+            self._profile_sync(gpu_slots.device)
             try:
                 self._host_pool.backup_from_device_all_layer(
                     self._device_pool,
                     host_slots_arg,
                     gpu_slots,
                     self.io_backend,
+                )
+                self._profile_sync(gpu_slots.device)
+                self._profile_add(
+                    "evict_backup_ms", (self._profile_now() - backup_t0) * 1000.0
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.exception(
@@ -640,9 +711,18 @@ class HybridKVCacheAttnBackend(AttentionBackend):
                     [existing, new_slots]
                 )
             if release_device:
+                release_t0 = self._profile_now()
                 self._release_device_slots(
                     req_to_token, req_pool_idx, n_host, gpu_slots
                 )
+                self._profile_add(
+                    "evict_release_ms", (self._profile_now() - release_t0) * 1000.0
+                )
+            self._profile_add(
+                "evict_total_ms", (self._profile_now() - evict_total_t0) * 1000.0
+            )
+            self._profile_inc("evict_batches")
+            self._profile_inc("evict_tokens", evict_n)
 
     def forward_extend(
         self,
@@ -688,6 +768,7 @@ class HybridKVCacheAttnBackend(AttentionBackend):
         )
         if layer.layer_id == last_layer_id:
             self._maybe_step_feedback(forward_batch)
+            self._profile_report_decode_step()
         return out
 
     def support_triton(self):
@@ -786,9 +867,18 @@ class HybridKVCacheAttnBackend(AttentionBackend):
             n_host_scored = int(host_idx_tensor.shape[0])
             top_k = max(int(self.topk_ratio * n_host_scored), 1)
 
+            hybrid_t0 = self._profile_now()
+            self._profile_inc("decode_layers")
+            self._profile_inc("decode_hybrid_reqs")
+            self._profile_inc("decode_cpu_len", n_host_total)
+            self._profile_inc("decode_effective_cpu_len", n_host_scored)
+            self._profile_inc("decode_gpu_len", int(per_req_tokens.numel()))
+            self._profile_inc("decode_topk", top_k)
+
             gpu_partial = None
             gpu_partial_event = None
             if self._should_overlap_gpu_partial(n_host_scored, per_req_tokens.numel()):
+                partial_t0 = self._profile_now()
                 current_stream = torch.cuda.current_stream(device)
                 with torch.cuda.stream(self._gpu_overlap_stream):
                     self._gpu_overlap_stream.wait_stream(current_stream)
@@ -811,20 +901,34 @@ class HybridKVCacheAttnBackend(AttentionBackend):
                     )
                     gpu_partial_event = torch.cuda.Event()
                     gpu_partial_event.record(self._gpu_overlap_stream)
+                self._profile_sync(device)
+                self._profile_add(
+                    "decode_gpu_partial_ms",
+                    (self._profile_now() - partial_t0) * 1000.0,
+                )
 
             # Read host K for the segment (CPU tensor, model dtype).
             k_host_seg = self._host_pool.k_buffer[layer.layer_id, host_idx_tensor]
             # CPU top-k. Keep model dtype throughout (no float32 upcast):
             # avoids an O(S * nkv * d) materialization per layer per step.
+            q_to_cpu_t0 = self._profile_now()
             q_cpu = per_req_q.detach().to("cpu")
+            self._profile_add(
+                "decode_q_to_cpu_ms", (self._profile_now() - q_to_cpu_t0) * 1000.0
+            )
+            cpu_topk_t0 = self._profile_now()
             topk_scores_cpu, topk_local_idx_cpu = compute_topk_on_cpu(
                 q_cpu, k_host_seg, top_k, nq, nkv, scaling, self._topk_workspace
+            )
+            self._profile_add(
+                "decode_cpu_topk_ms", (self._profile_now() - cpu_topk_t0) * 1000.0
             )
             k_eff = topk_scores_cpu.shape[1]
 
             # Gather each Q head's selected V directly. This keeps the same
             # sparse softmax set as the old unique+scatter representation, but
             # avoids building shared columns and per-head -inf masks.
+            host_v_t0 = self._profile_now()
             host_idx_per_head = torch.take(
                 host_idx_tensor, topk_local_idx_cpu.reshape(-1)
             )
@@ -832,17 +936,27 @@ class HybridKVCacheAttnBackend(AttentionBackend):
             v_topk_host = self._host_pool.v_buffer[
                 layer.layer_id, host_idx_per_head, kv_heads
             ].view(nq, k_eff, layer.v_head_dim)
+            self._profile_add(
+                "decode_host_v_gather_ms",
+                (self._profile_now() - host_v_t0) * 1000.0,
+            )
 
+            h2d_t0 = self._profile_now()
+            self._profile_sync(device)
             scores_gpu, v_topk_gpu, topk_copy_event = self._copy_topk_to_device_async(
                 topk_scores_cpu, v_topk_host, device, per_req_q.dtype
             )
 
             if topk_copy_event is not None:
                 torch.cuda.current_stream(device).wait_event(topk_copy_event)
+            self._profile_sync(device)
+            self._profile_add("decode_h2d_ms", (self._profile_now() - h2d_t0) * 1000.0)
 
             if gpu_partial_event is not None:
                 torch.cuda.current_stream(device).wait_event(gpu_partial_event)
 
+            gpu_attn_t0 = self._profile_now()
+            self._profile_sync(device)
             if gpu_partial is not None:
                 out_seq = merge_gpu_partial_with_topk_triton(
                     gpu_partial[0],
@@ -867,6 +981,13 @@ class HybridKVCacheAttnBackend(AttentionBackend):
                     nkv,
                     scaling,
                 )
+            self._profile_sync(device)
+            self._profile_add(
+                "decode_gpu_attn_ms", (self._profile_now() - gpu_attn_t0) * 1000.0
+            )
             out_view[seq_idx] = out_seq
+            self._profile_add(
+                "decode_total_ms", (self._profile_now() - hybrid_t0) * 1000.0
+            )
 
         return output

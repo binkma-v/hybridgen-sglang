@@ -52,6 +52,8 @@ python -m sglang.launch_server \
   --hybridgen-host-layout layer_first
 ```
 
+For decode profiling, launch with `SGLANG_HYBRIDGEN_PROFILE=1`. The backend logs per-layer averages every `SGLANG_HYBRIDGEN_PROFILE_INTERVAL` decode steps, including CPU top-k, host V gather, H2D, GPU attention/merge, and eviction copy time. Profiling synchronizes GPU work for measurement, so use it for attribution rather than throughput numbers.
+
 On A100-40GB with Qwen2.5-Coder-3B, forced eviction (`gpu_cache_factor=0.1`) and 32-token decode completed successfully for 2k/4k/8k prompts. The optimized hybrid path measured approximately 1.74s / 1.84s / 2.02s respectively in the latest guarded-overlap run, down from 20.9s at 8k before cap/workspace/fused-kernel fixes.
 
 For the full design, implementation notes, benchmark commands, and remaining follow-ups, see [INTEGRATION.md](INTEGRATION.md).
