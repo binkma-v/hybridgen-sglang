@@ -21,6 +21,10 @@ from sglang.srt.mem_cache.cpp_radix_tree.radix_tree import (
     RadixTreeCpp,
     TreeNodeCpp,
 )
+from sglang.srt.mem_cache.hybridgen_release import (
+    has_released_device_indices,
+    valid_device_indices,
+)
 from sglang.srt.mem_cache.radix_cache import RadixKey
 
 if TYPE_CHECKING:
@@ -176,6 +180,12 @@ class RadixCacheCpp(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
         ].to(dtype=torch.int64, copy=True)
+        if has_released_device_indices(kv_indices):
+            self.token_to_kv_pool_allocator.free(
+                valid_device_indices(kv_indices[req.cache_protected_len :])
+            )
+            self.dec_lock_ref(req.last_node)
+            return
 
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
         # it will automatically align them, but length of them should be equal
@@ -214,6 +224,13 @@ class RadixCacheCpp(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :prefill_len
         ].to(dtype=torch.int64, copy=True)
+        if has_released_device_indices(kv_indices):
+            logger.warning(
+                "Skipping C++ radix insertion for unfinished request %s because "
+                "HybridGen has released part of its GPU KV prefix.",
+                req.rid,
+            )
+            return
 
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
         # it will automatically align them, but length of them should be equal

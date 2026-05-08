@@ -63,6 +63,10 @@ from sglang.srt.mem_cache.evict_policy import (
     SLRUStrategy,
 )
 from sglang.srt.mem_cache.hicache_storage import get_hash_str, hash_str_to_int64
+from sglang.srt.mem_cache.hybridgen_release import (
+    has_released_device_indices,
+    valid_device_indices,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -471,13 +475,23 @@ class RadixCache(BasePrefixCache):
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_committed_len
             ]
-            self.token_to_kv_pool_allocator.free(kv_indices)
+            self.token_to_kv_pool_allocator.free(valid_device_indices(kv_indices))
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
+        if has_released_device_indices(kv_indices):
+            # HybridGen has already backed up and released a prefix of this
+            # request from the GPU allocator. The full prefix is no longer
+            # insertable into the device radix tree, so skip insertion and free
+            # only the still-resident GPU suffix.
+            self.token_to_kv_pool_allocator.free(
+                valid_device_indices(kv_indices[req.cache_protected_len :])
+            )
+            self.dec_lock_ref(req.last_node)
+            return
 
         # Maybe convert to bigram keys for EAGLE
         keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids
@@ -516,6 +530,13 @@ class RadixCache(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
+        if has_released_device_indices(kv_indices):
+            logger.warning(
+                "Skipping radix insertion for unfinished request %s because "
+                "HybridGen has released part of its GPU KV prefix.",
+                req.rid,
+            )
+            return
 
         # Maybe convert to bigram keys for EAGLE
         keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids

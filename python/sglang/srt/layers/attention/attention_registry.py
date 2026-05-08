@@ -109,6 +109,15 @@ def create_torch_native_backend(runner):
     return TorchNativeAttnBackend(runner)
 
 
+@register_attention_backend("hybrid_kvcache")
+def create_hybrid_kvcache_backend(runner):
+    from sglang.srt.layers.attention.hybrid_kvcache_backend import (
+        HybridKVCacheAttnBackend,
+    )
+
+    return HybridKVCacheAttnBackend(runner)
+
+
 @register_attention_backend("flex_attention")
 def create_flex_attention_backend(runner):
     from sglang.srt.layers.attention.torch_flex_backend import TorchFlexAttnBackend

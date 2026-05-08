@@ -130,6 +130,7 @@ ATTENTION_BACKEND_CHOICES = [
     "torch_native",
     "flex_attention",
     "nsa",
+    "hybrid_kvcache",
     # NVIDIA specific
     "cutlass_mla",
     "fa3",
@@ -591,6 +592,17 @@ class ServerArgs:
     ds_heavy_token_num: int = 256
     ds_heavy_channel_type: str = "qk"
     ds_sparse_decode_threshold: int = 4096
+
+    # HybridGen hybrid CPU/GPU KV-cache attention
+    hybridgen_topk_ratio: float = 0.05
+    hybridgen_cpu_k_cap: int = 2048
+    hybridgen_gpu_cache_factor: float = 1.0
+    hybridgen_feedback_interval: int = 0
+    hybridgen_gpu_q_proj: bool = True
+    hybridgen_host_size: int = 0
+    hybridgen_host_ratio: float = 2.0
+    hybridgen_host_layout: str = "layer_first"
+    hybridgen_io_backend: str = "kernel"
 
     # Offloading
     cpu_offload_gb: int = 0
@@ -4675,6 +4687,65 @@ class ServerArgs:
             choices=ATTENTION_BACKEND_CHOICES,
             default=ServerArgs.decode_attention_backend,
             help="Choose the kernels for decode attention layers (have priority over --attention-backend).",
+        )
+        parser.add_argument(
+            "--hybridgen-topk-ratio",
+            type=float,
+            default=ServerArgs.hybridgen_topk_ratio,
+            help="HybridGen: fraction of host-resident KV tokens selected via CPU-side QK^T top-k each decode step.",
+        )
+        parser.add_argument(
+            "--hybridgen-cpu-k-cap",
+            type=int,
+            default=ServerArgs.hybridgen_cpu_k_cap,
+            help="HybridGen: cap on host-resident K length considered during CPU top-k "
+            "(default 2048; 0 scans the full host segment until feedback tightens it).",
+        )
+        parser.add_argument(
+            "--hybridgen-gpu-cache-factor",
+            type=float,
+            default=ServerArgs.hybridgen_gpu_cache_factor,
+            help="HybridGen: GPU cache size multiplier relative to prompt_len "
+            "(matches hybridgen's --gpu-cache-factor; default 1.0 = GPU holds whole prompt, "
+            "evict only when decode grows beyond it; <1.0 evicts part of prompt during prefill).",
+        )
+        parser.add_argument(
+            "--hybridgen-feedback-interval",
+            type=int,
+            default=ServerArgs.hybridgen_feedback_interval,
+            help="HybridGen: decode steps between latency-feedback updates of topk_ratio / cpu_k_cap (0 disables feedback).",
+        )
+        parser.add_argument(
+            "--hybridgen-gpu-q-proj",
+            action="store_true",
+            default=ServerArgs.hybridgen_gpu_q_proj,
+            help="HybridGen: project Q on GPU then copy to CPU (faster on most setups).",
+        )
+        parser.add_argument(
+            "--hybridgen-host-size",
+            type=int,
+            default=ServerArgs.hybridgen_host_size,
+            help="HybridGen: host KV pool size in GB (overrides ratio when > 0).",
+        )
+        parser.add_argument(
+            "--hybridgen-host-ratio",
+            type=float,
+            default=ServerArgs.hybridgen_host_ratio,
+            help="HybridGen: host KV pool size as a multiple of GPU KV pool size when host_size is 0.",
+        )
+        parser.add_argument(
+            "--hybridgen-host-layout",
+            type=str,
+            default=ServerArgs.hybridgen_host_layout,
+            choices=["layer_first", "page_first", "page_first_direct", "page_head"],
+            help="HybridGen: memory layout of the host KV pool.",
+        )
+        parser.add_argument(
+            "--hybridgen-io-backend",
+            type=str,
+            default=ServerArgs.hybridgen_io_backend,
+            choices=["kernel", "direct"],
+            help="HybridGen: device<->host KV transfer backend.",
         )
         parser.add_argument(
             "--sampling-backend",

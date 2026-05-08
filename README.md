@@ -21,6 +21,41 @@
 <a href="https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#slides"><b>Slides</b></a>
 </p>
 
+## HybridGen × SGLang Integration
+
+This fork integrates a HybridGen-style KV cache offloading backend into SGLang.
+It keeps the recent KV segment on GPU, offloads older KV to host memory, selects CPU-resident heavy-hitter tokens with CPU top-k, and computes one merged softmax over CPU top-k scores plus the GPU dense segment.
+
+Implemented work in this fork:
+
+- `hybrid_kvcache` attention backend for MHA models.
+- Host KV storage through SGLang's `MHATokenToKVPoolHost`.
+- GPU KV shadow release for request-owned offloaded tokens, with released-slot cleanup protections in chunk/radix cache paths.
+- Adaptive `topk_ratio` / `cpu_k_cap` feedback policy, with default `cpu_k_cap=2048`.
+- Decode hot-path optimizations: grouped CPU bmm, reusable top-k workspace, per-head V gather without `torch.unique`, and a Triton fused merged-softmax kernel.
+- Unit tests for release semantics, feedback cap behavior, CPU top-k workspace reuse, and Triton fused attention equivalence.
+
+Example launch:
+
+```bash
+python -m sglang.launch_server \
+  --model-path /path/to/model \
+  --attention-backend hybrid_kvcache \
+  --disable-radix-cache \
+  --disable-cuda-graph \
+  --disable-piecewise-cuda-graph \
+  --hybridgen-gpu-cache-factor 0.1 \
+  --hybridgen-topk-ratio 0.05 \
+  --hybridgen-cpu-k-cap 2048 \
+  --hybridgen-feedback-interval 4 \
+  --hybridgen-host-ratio 2.0 \
+  --hybridgen-host-layout layer_first
+```
+
+On A100-40GB with Qwen2.5-Coder-3B, forced eviction (`gpu_cache_factor=0.1`) and 32-token decode completed successfully for 2k/4k/8k prompts. The optimized hybrid path measured approximately 1.72s / 1.81s / 1.99s respectively, down from 20.9s at 8k before cap/workspace/fused-kernel fixes.
+
+For the full design, implementation notes, benchmark commands, and remaining follow-ups, see [INTEGRATION.md](INTEGRATION.md).
+
 ## News
 - [2026/02] 🔥 Unlocking 25x Inference Performance with SGLang on NVIDIA GB300 NVL72 ([blog](https://lmsys.org/blog/2026-02-20-gb300-inferencex/)).
 - [2026/01] 🔥 SGLang Diffusion accelerates video and image generation ([blog](https://lmsys.org/blog/2026-01-16-sglang-diffusion/)).
