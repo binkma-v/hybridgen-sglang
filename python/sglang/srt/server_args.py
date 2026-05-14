@@ -131,6 +131,7 @@ ATTENTION_BACKEND_CHOICES = [
     "flex_attention",
     "nsa",
     "hybrid_kvcache",
+    "offload_only",
     # NVIDIA specific
     "cutlass_mla",
     "fa3",

@@ -16,6 +16,10 @@ serving APIs, model support, and deployment:
 ## Implemented Work
 
 - `hybrid_kvcache` attention backend for MHA models.
+- `offload_only` baseline backend: same eviction / host pool as
+  `hybrid_kvcache`, but every decode step loads the full host KV segment back
+  to GPU and runs dense SDPA (no CPU-side QK^T, no top-k, no merged softmax).
+  Useful for isolating the cost of "offload + full PCIe load-back".
 - Host KV storage through SGLang's `MHATokenToKVPoolHost`.
 - GPU KV shadow release for request-owned offloaded tokens, with cleanup
   protections in chunk/radix cache paths.
@@ -135,6 +139,52 @@ env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
   --max-total-tokens 12288 \
   --mem-fraction-static 0.70
 ```
+
+## Launch Offload-Only Baseline
+
+This baseline shares the eviction + host KV pool path with `hybrid_kvcache`
+but performs **no CPU computation**: every decode step the request's entire
+host KV segment is pulled back to GPU over PCIe and a dense SDPA is run on
+`[host_kv, gpu_kv]`. Use it to measure the isolated cost of offload + full
+PCIe load-back, side by side with `hybrid_kvcache` (CPU top-k) and
+`torch_native` (no offload).
+
+```bash
+env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+  -u all_proxy -u ALL_PROXY \
+  HOME=/home/binkma \
+  PYTHONPATH=python \
+  NO_PROXY=127.0.0.1,localhost \
+  no_proxy=127.0.0.1,localhost \
+  .venv/bin/python -m sglang.launch_server \
+  --model-path "$MODEL" \
+  --host 127.0.0.1 \
+  --port 31000 \
+  --attention-backend offload_only \
+  --disable-radix-cache \
+  --disable-cuda-graph \
+  --disable-piecewise-cuda-graph \
+  --max-running-requests 1 \
+  --max-total-tokens 12288 \
+  --mem-fraction-static 0.70 \
+  --hybridgen-gpu-cache-factor 0.1 \
+  --hybridgen-min-gpu-recent-tokens 512 \
+  --hybridgen-host-ratio 2.0 \
+  --hybridgen-host-layout layer_first
+```
+
+Relevant flags (shared with `hybrid_kvcache`):
+
+- `--hybridgen-gpu-cache-factor`: GPU residency cap = `factor * prompt_len`.
+- `--hybridgen-min-gpu-recent-tokens`: minimum recent KV kept on GPU.
+- `--hybridgen-host-ratio` / `--hybridgen-host-size`: host pool sizing.
+- `--hybridgen-host-layout`: host KV memory layout.
+- `--hybridgen-io-backend`: device<->host KV transfer backend (`kernel` /
+  `direct`).
+
+Ignored by this backend (no CPU compute, no feedback):
+`--hybridgen-topk-ratio`, `--hybridgen-cpu-k-cap`,
+`--hybridgen-feedback-interval`, `--hybridgen-gpu-q-proj`.
 
 ## Benchmark Requests
 
@@ -256,6 +306,23 @@ offload starts, instead of only 12 or 51 tokens with the old factor-only rule.
 The remaining gap versus pure GPU is mostly the host path: CPU top-k, host V
 gather, H2D transfer, and feedback increasing top-k ratio as the host segment
 grows.
+
+### Offload-Only Baseline vs HybridGen
+
+Decode-dominant comparison with `prompt=2048`, `max_new_tokens=2048`,
+`gpu_cache_factor=0.1`, `min_gpu_recent=512`. Same eviction (≈90% of KV
+offloaded to host) for both backends; only the attention path differs.
+
+| Backend | Total latency | Throughput | vs `offload_only` |
+|---|---:|---:|---:|
+| `offload_only` (full host KV pulled back to GPU each step) | 134.2 s | 15.3 tok/s | 1.00× (baseline) |
+| `hybrid_kvcache` (CPU top-k + merged softmax, top-k=5%)    |  91.4 s | 22.4 tok/s | **0.68× / 1.47× faster** |
+
+What it isolates: every decode step `offload_only` moves the whole host KV
+segment back to GPU (PCIe traffic `O(n_host · nkv · head_dim)` per layer);
+`hybrid_kvcache` does QK^T scoring on CPU and only ships the top-k V
+(`O(top_k · nq · head_dim)`). At ~3.5k host tokens the CPU bmm + smaller H2D
+already beats full load-back by 1.47×.
 
 ## Repository Notes
 

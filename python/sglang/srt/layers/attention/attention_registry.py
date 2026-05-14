@@ -118,6 +118,15 @@ def create_hybrid_kvcache_backend(runner):
     return HybridKVCacheAttnBackend(runner)
 
 
+@register_attention_backend("offload_only")
+def create_offload_only_backend(runner):
+    from sglang.srt.layers.attention.offload_only_backend import (
+        OffloadOnlyAttnBackend,
+    )
+
+    return OffloadOnlyAttnBackend(runner)
+
+
 @register_attention_backend("flex_attention")
 def create_flex_attention_backend(runner):
     from sglang.srt.layers.attention.torch_flex_backend import TorchFlexAttnBackend
